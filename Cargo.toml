@@ -27,6 +27,7 @@ members = [
     "crates/call",
     "crates/channel",
     "crates/cli",
+    "crates/code_atlas",
     "crates/client",
     "crates/clock",
     "crates/cloud_api_client",
@@ -261,6 +262,7 @@ buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
 channel = { path = "crates/channel" }
 cli = { path = "crates/cli" }
+code_atlas = { path = "crates/code_atlas" }
 client = { path = "crates/client" }
 clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
