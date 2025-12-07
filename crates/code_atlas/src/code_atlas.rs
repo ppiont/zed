@@ -1,7 +1,10 @@
+mod treemap;
+
 use gpui::{
-    actions, canvas, div, fill, point, px, size, App, Bounds, Context, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Render, SharedString, Window,
+    actions, canvas, div, fill, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
+    Render, SharedString, Window,
 };
+use treemap::squarify;
 use ui::{prelude::*, Icon, IconName};
 use workspace::item::ItemEvent;
 use workspace::{Item, Workspace};
@@ -66,20 +69,35 @@ impl Item for CodeAtlas {
 impl Render for CodeAtlas {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().colors().surface_background;
-        let accent = cx.theme().colors().text_accent;
+        let colors = [
+            cx.theme().status().modified,
+            cx.theme().status().created,
+            cx.theme().status().info,
+            cx.theme().status().warning,
+        ];
+
+        let test_sizes: Vec<(usize, f64)> = vec![
+            (0, 1000.0),
+            (1, 800.0),
+            (2, 600.0),
+            (3, 400.0),
+            (4, 300.0),
+            (5, 200.0),
+            (6, 150.0),
+            (7, 100.0),
+        ];
 
         div()
             .size_full()
             .bg(bg)
             .child(
                 canvas(
-                    |bounds, _, _| bounds,
-                    move |bounds, _, window, _| {
-                        let rect = Bounds::new(
-                            point(bounds.origin.x + px(50.), bounds.origin.y + px(50.)),
-                            size(px(200.), px(100.)),
-                        );
-                        window.paint_quad(fill(rect, accent));
+                    move |bounds, _, _| squarify(&test_sizes, bounds),
+                    move |_bounds, nodes, window, _| {
+                        for node in nodes {
+                            let color = colors[node.id % colors.len()];
+                            window.paint_quad(fill(node.bounds, color));
+                        }
                     },
                 )
                 .size_full(),
