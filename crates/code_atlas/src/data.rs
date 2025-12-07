@@ -72,14 +72,26 @@ impl TreemapNode {
     }
 }
 
-/// Builds hierarchical tree from flat file entries
+/// Builds hierarchical tree from flat file entries (iterative to avoid stack overflow)
 pub fn build_tree(entries: impl Iterator<Item = Entry>, worktree_path: &Path) -> Vec<TreemapNode> {
     let mut files_by_parent: HashMap<String, Vec<Entry>> = HashMap::new();
     let mut directories: HashMap<String, Entry> = HashMap::new();
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_dir_paths: Vec<String> = Vec::new();
 
     for entry in entries {
         let path_str = entry.path.as_unix_str().to_string();
         if entry.is_dir() {
+            let parent = entry
+                .path
+                .parent()
+                .map(|p| p.as_unix_str().to_string())
+                .unwrap_or_default();
+            children_by_parent
+                .entry(parent)
+                .or_default()
+                .push(path_str.clone());
+            all_dir_paths.push(path_str.clone());
             directories.insert(path_str, entry);
         } else {
             let parent = entry
@@ -91,44 +103,67 @@ pub fn build_tree(entries: impl Iterator<Item = Entry>, worktree_path: &Path) ->
         }
     }
 
-    fn build_node(
-        path: &str,
-        files_by_parent: &HashMap<String, Vec<Entry>>,
-        directories: &HashMap<String, Entry>,
-        worktree_path: &Path,
-    ) -> Vec<TreemapNode> {
-        let mut nodes = Vec::new();
+    // Sort directories by path depth (deepest first) so we process leaves before parents
+    all_dir_paths.sort_by(|a, b| {
+        let depth_a = a.matches('/').count();
+        let depth_b = b.matches('/').count();
+        depth_b.cmp(&depth_a)
+    });
 
-        if let Some(files) = files_by_parent.get(path) {
+    // Build nodes bottom-up: process deepest directories first
+    let mut built_nodes: HashMap<String, Vec<TreemapNode>> = HashMap::new();
+
+    for dir_path in &all_dir_paths {
+        let mut children = Vec::new();
+
+        // Add file children
+        if let Some(files) = files_by_parent.get(dir_path) {
             for entry in files {
-                nodes.push(TreemapNode::from_entry(entry, worktree_path));
+                children.push(TreemapNode::from_entry(entry, worktree_path));
             }
         }
 
-        for (dir_path_str, dir_entry) in directories.iter() {
-            let dir_path = dir_entry.path.as_ref();
-            let parent_str = dir_path
-                .parent()
-                .map(|p| p.as_unix_str())
-                .unwrap_or("");
-
-            let matches = parent_str == path;
-
-            if matches {
-                let mut dir_node = TreemapNode::from_entry(dir_entry, worktree_path);
-                dir_node.children =
-                    build_node(dir_path_str, files_by_parent, directories, worktree_path);
-                dir_node.compute_aggregate_size();
-                if dir_node.size > 0 {
-                    nodes.push(dir_node);
+        // Add directory children (already built since we process deepest first)
+        if let Some(child_dir_paths) = children_by_parent.get(dir_path) {
+            for child_path in child_dir_paths {
+                if let Some(mut child_nodes) = built_nodes.remove(child_path) {
+                    children.append(&mut child_nodes);
                 }
             }
         }
 
-        nodes
+        // Create the directory node with its children
+        if let Some(dir_entry) = directories.get(dir_path) {
+            let mut dir_node = TreemapNode::from_entry(dir_entry, worktree_path);
+            dir_node.children = children;
+            dir_node.compute_aggregate_size();
+            if dir_node.size > 0 {
+                let parent = dir_entry
+                    .path
+                    .parent()
+                    .map(|p| p.as_unix_str().to_string())
+                    .unwrap_or_default();
+                built_nodes.entry(parent).or_default().push(dir_node);
+            }
+        }
     }
 
-    build_node("", &files_by_parent, &directories, worktree_path)
+    // Collect root nodes
+    let mut root_nodes = Vec::new();
+
+    // Add root-level files
+    if let Some(files) = files_by_parent.get("") {
+        for entry in files {
+            root_nodes.push(TreemapNode::from_entry(entry, worktree_path));
+        }
+    }
+
+    // Add root-level directories
+    if let Some(root_dir_nodes) = built_nodes.remove("") {
+        root_nodes.extend(root_dir_nodes);
+    }
+
+    root_nodes
 }
 
 /// Flattens a tree node for layout (shows children if expanded, otherwise just the node)
