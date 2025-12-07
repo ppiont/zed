@@ -1,15 +1,19 @@
 mod data;
 mod interaction;
+mod loc_worker;
+mod persistence;
 mod treemap;
 
-use data::{build_tree, TreemapNode};
+use data::{build_tree, NodeId, TreemapNode};
 use gpui::{
     actions, canvas, div, point, px, quad, App, Bounds, BorderStyle, Context, Entity,
     EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SharedString, Size, Window,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollWheelEvent, SharedString, Size, Task, Window,
 };
 use interaction::InteractionState;
-use project::Project;
+use loc_worker::{spawn_loc_worker, LocResult};
+use project::{Project, ProjectEntryId};
+use std::collections::HashMap;
 use treemap::squarify;
 use ui::{prelude::*, Icon, IconName};
 use workspace::item::ItemEvent;
@@ -25,22 +29,102 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct CodeAtlas {
-    #[allow(dead_code)]
     project: Entity<Project>,
     focus_handle: FocusHandle,
     root_nodes: Vec<TreemapNode>,
     interaction: InteractionState,
+    loc_cache: HashMap<ProjectEntryId, u64>,
+    #[allow(dead_code)]
+    loc_loading: bool,
+    #[allow(dead_code)]
+    loc_task: Option<Task<()>>,
 }
 
 impl CodeAtlas {
     pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
         let root_nodes = Self::load_file_tree(&project, cx);
 
-        Self {
-            project,
+        let mut atlas = Self {
+            project: project.clone(),
             focus_handle: cx.focus_handle(),
             root_nodes,
             interaction: InteractionState::default(),
+            loc_cache: HashMap::new(),
+            loc_loading: true,
+            loc_task: None,
+        };
+
+        atlas.start_loc_loading(cx);
+        atlas
+    }
+
+    fn start_loc_loading(&mut self, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        let mut files_to_count = Vec::new();
+
+        for worktree in project.visible_worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let worktree_id = worktree.id().to_proto() as i64;
+            let snapshot = worktree.snapshot();
+            let worktree_path = snapshot.abs_path();
+
+            for entry in snapshot.files(false, 0) {
+                let full_path = worktree_path.join(entry.path.as_unix_str());
+                let (mtime_s, mtime_ns) = entry
+                    .mtime
+                    .as_ref()
+                    .and_then(|m| m.to_seconds_and_nanos_for_persistence())
+                    .map(|(s, ns)| (s as i64, ns as i32))
+                    .unwrap_or((0, 0));
+
+                files_to_count.push((
+                    entry.id,
+                    full_path.to_path_buf(),
+                    worktree_id,
+                    mtime_s,
+                    mtime_ns,
+                ));
+            }
+        }
+
+        let weak_self = cx.weak_entity();
+        let executor = cx.background_executor().clone();
+
+        self.loc_task = Some(cx.spawn(async move |_this, mut cx| {
+            let (tx, rx) = smol::channel::bounded::<Vec<LocResult>>(1);
+
+            let _worker = spawn_loc_worker(executor, files_to_count, move |results| {
+                let _ = tx.send_blocking(results);
+            });
+
+            while let Ok(results) = rx.recv().await {
+                let _ = weak_self.update(cx, |this, cx| {
+                    for result in &results {
+                        this.loc_cache.insert(result.entry_id, result.loc);
+                    }
+                    this.update_node_sizes();
+                    this.loc_loading = false;
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    fn update_node_sizes(&mut self) {
+        fn update_recursive(node: &mut TreemapNode, cache: &HashMap<ProjectEntryId, u64>) {
+            if let NodeId::File(id) = node.id {
+                if let Some(&loc) = cache.get(&id) {
+                    node.size = loc;
+                }
+            }
+            for child in &mut node.children {
+                update_recursive(child, cache);
+            }
+            node.compute_aggregate_size();
+        }
+
+        for node in &mut self.root_nodes {
+            update_recursive(node, &self.loc_cache);
         }
     }
 

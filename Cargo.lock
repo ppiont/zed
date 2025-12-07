@@ -3340,8 +3340,11 @@ name = "code_atlas"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "db",
  "gpui",
+ "log",
  "project",
+ "smol",
  "ui",
  "workspace",
  "worktree",

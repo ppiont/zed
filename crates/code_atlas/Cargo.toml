@@ -13,8 +13,11 @@ path = "src/code_atlas.rs"
 
 [dependencies]
 anyhow.workspace = true
+db.workspace = true
 gpui.workspace = true
+log.workspace = true
 project.workspace = true
+smol.workspace = true
 ui.workspace = true
 workspace.workspace = true
 worktree.workspace = true
