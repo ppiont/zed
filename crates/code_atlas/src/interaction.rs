@@ -14,6 +14,8 @@ pub struct InteractionState {
     pub is_panning: bool,
     /// Last mouse position during pan
     pub last_pan_position: Point<Pixels>,
+    /// Whether actual movement occurred during pan (to distinguish clicks from drags)
+    pub did_pan: bool,
 }
 
 impl Default for InteractionState {
@@ -25,6 +27,7 @@ impl Default for InteractionState {
             max_zoom: 10.0,
             is_panning: false,
             last_pan_position: point(px(0.), px(0.)),
+            did_pan: false,
         }
     }
 }
@@ -92,6 +95,7 @@ impl InteractionState {
     /// Start panning from a position
     pub fn start_pan(&mut self, position: Point<Pixels>) {
         self.is_panning = true;
+        self.did_pan = false;
         self.last_pan_position = position;
     }
 
@@ -102,11 +106,15 @@ impl InteractionState {
             let delta_y = position.y - self.last_pan_position.y;
             self.pan_offset = point(self.pan_offset.x + delta_x, self.pan_offset.y + delta_y);
             self.last_pan_position = position;
+            self.did_pan = true;
         }
     }
 
-    /// Stop panning
-    pub fn stop_pan(&mut self) {
+    /// Stop panning and return whether it was a click (no actual movement)
+    pub fn stop_pan(&mut self) -> bool {
         self.is_panning = false;
+        let was_click = !self.did_pan;
+        self.did_pan = false;
+        was_click
     }
 }

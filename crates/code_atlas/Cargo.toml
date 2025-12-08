@@ -18,6 +18,11 @@ gpui.workspace = true
 log.workspace = true
 project.workspace = true
 smol.workspace = true
+streemap = "0.1"
 ui.workspace = true
 workspace.workspace = true
 worktree.workspace = true
+theme.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }

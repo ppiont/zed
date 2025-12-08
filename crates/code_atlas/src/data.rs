@@ -56,9 +56,7 @@ impl TreemapNode {
         }
     }
 
-    pub fn is_file(&self) -> bool {
-        matches!(self.id, NodeId::File(_))
-    }
+
 
     #[allow(dead_code)]
     pub fn is_directory(&self) -> bool {
@@ -69,6 +67,11 @@ impl TreemapNode {
         if !self.children.is_empty() {
             self.size = self.children.iter().map(|c| c.size).sum();
         }
+    }
+
+    /// Get display size (LOC if available, else file size)
+    pub fn display_size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -166,11 +169,4 @@ pub fn build_tree(entries: impl Iterator<Item = Entry>, worktree_path: &Path) ->
     root_nodes
 }
 
-/// Flattens a tree node for layout (shows children if expanded, otherwise just the node)
-pub fn flatten_for_layout(node: &TreemapNode) -> Vec<&TreemapNode> {
-    if node.is_expanded && !node.children.is_empty() {
-        node.children.iter().flat_map(flatten_for_layout).collect()
-    } else {
-        vec![node]
-    }
-}
+
