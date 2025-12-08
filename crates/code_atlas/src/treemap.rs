@@ -8,9 +8,10 @@ pub struct LayoutNode {
     pub id: NodeId,
     pub name: String,
     pub bounds: Bounds<Pixels>,
+    pub children: Vec<LayoutNode>,
 }
 
-/// Computes flat layout for file nodes using the squarified treemap algorithm
+/// Recursively computes layout for nodes using the squarified treemap algorithm
 pub fn layout_tree(
     nodes: &[TreemapNode],
     bounds: Bounds<Pixels>,
@@ -42,6 +43,9 @@ pub fn layout_tree(
         return Vec::new();
     }
 
+    // Sort by size descending - squarify works best with sorted input
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     let streemap_bounds = Rect {
         x: f64::from(bounds.origin.x),
         y: f64::from(bounds.origin.y),
@@ -60,16 +64,26 @@ pub fn layout_tree(
         .iter()
         .map(|(idx, _, item_rect)| {
             let node = &nodes[*idx];
+            let node_bounds = Bounds::new(
+                Point::new(px(item_rect.x as f32), px(item_rect.y as f32)),
+                Size {
+                    width: px(item_rect.w as f32),
+                    height: px(item_rect.h as f32),
+                },
+            );
+
+            // Recursively layout children directly in the same bounds (no padding)
+            let children = if node.is_directory() && !node.children.is_empty() {
+                layout_tree(&node.children, node_bounds, 1.0)
+            } else {
+                Vec::new()
+            };
+
             LayoutNode {
                 id: node.id,
                 name: node.name.clone(),
-                bounds: Bounds::new(
-                    Point::new(px(item_rect.x as f32), px(item_rect.y as f32)),
-                    Size {
-                        width: px(item_rect.w as f32),
-                        height: px(item_rect.h as f32),
-                    },
-                ),
+                bounds: node_bounds,
+                children,
             }
         })
         .collect()

@@ -13,6 +13,7 @@ path = "src/code_atlas.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytecount = "0.6"
 db.workspace = true
 gpui.workspace = true
 log.workspace = true

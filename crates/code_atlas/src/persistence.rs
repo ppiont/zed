@@ -58,30 +58,28 @@ impl CodeAtlasDb {
     }
 
     query! {
-        pub async fn save_git_info(
+        pub async fn save_git_timestamp(
             worktree_id: i64,
             entry_id: i64,
-            path: String,
-            last_commit_timestamp: Option<i64>,
-            last_author: Option<String>,
+            last_commit_timestamp: i64,
             mtime_seconds: i64,
             mtime_nanos: i32
         ) -> Result<()> {
             INSERT OR REPLACE INTO git_cache(
                 worktree_id, entry_id, path, last_commit_timestamp, last_author,
                 mtime_seconds, mtime_nanos
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ) VALUES (?1, ?2, "-", ?3, NULL, ?4, ?5)
         }
     }
 
     query! {
-        pub fn get_git_info(
+        pub fn get_git_timestamp(
             worktree_id: i64,
             entry_id: i64,
             mtime_seconds: i64,
             mtime_nanos: i32
-        ) -> Result<Option<(Option<i64>, Option<String>)>> {
-            SELECT last_commit_timestamp, last_author FROM git_cache
+        ) -> Result<Option<i64>> {
+            SELECT last_commit_timestamp FROM git_cache
             WHERE worktree_id = ?1
               AND entry_id = ?2
               AND mtime_seconds = ?3

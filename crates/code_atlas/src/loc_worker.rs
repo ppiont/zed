@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpui::{BackgroundExecutor, Task};
 use project::ProjectEntryId;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 use crate::persistence::CODE_ATLAS_DB;
@@ -14,8 +14,17 @@ pub struct LocResult {
 
 pub fn count_lines(path: &std::path::Path) -> Result<u64> {
     let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader.lines().count() as u64)
+    let mut reader = BufReader::new(file);
+    let mut count = 0u64;
+    let mut buf = [0u8; 32768];
+    loop {
+        let bytes_read = reader.read(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        count += bytecount::count(&buf[..bytes_read], b'\n') as u64;
+    }
+    Ok(count)
 }
 
 pub fn spawn_loc_worker(

@@ -1,7 +1,7 @@
-use anyhow::Result;
 use gpui::{BackgroundExecutor, Task};
 use project::ProjectEntryId;
 use smol::process::Command;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::persistence::CODE_ATLAS_DB;
@@ -10,108 +10,123 @@ use crate::persistence::CODE_ATLAS_DB;
 pub struct GitResult {
     pub entry_id: ProjectEntryId,
     pub timestamp: Option<i64>,
-    #[allow(dead_code)]
-    pub author: Option<String>,
-    #[allow(dead_code)]
-    pub worktree_id: i64,
-    #[allow(dead_code)]
-    pub path: String,
-    #[allow(dead_code)]
-    pub mtime_s: i64,
-    #[allow(dead_code)]
-    pub mtime_ns: i32,
-}
-
-/// Gets last commit info for a file using git log (async version)
-async fn get_last_commit_info(
-    repo_path: &std::path::Path,
-    file_path: &std::path::Path,
-) -> Result<(Option<i64>, Option<String>)> {
-    // git log -1 --format=%at%n%an -- <file>
-    // %at: author time, unix timestamp
-    // %an: author name
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["log", "-1", "--format=%at\n%an", "--"])
-        .arg(file_path)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Ok((None, None));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-
-    let timestamp = lines.next().and_then(|s| s.parse::<i64>().ok());
-    let author = lines.next().map(|s| s.to_string());
-
-    Ok((timestamp, author))
 }
 
 pub fn spawn_git_worker(
     executor: BackgroundExecutor,
     repo_path: PathBuf,
-    files: Vec<(ProjectEntryId, PathBuf, i64, i64, i32)>, // entry_id, relative_path, worktree_id, mtime_s, mtime_ns
+    files: Vec<(ProjectEntryId, PathBuf, i64, i64, i32)>,
     mut on_result: impl FnMut(GitResult) + Send + 'static,
 ) -> Task<()> {
     executor.spawn(async move {
-        for (entry_id, file_path, worktree_id, mtime_s, mtime_ns) in files {
-            // Check cache first (includes mtime validation for cache invalidation)
-            if let Ok(Some((timestamp, author))) = CODE_ATLAS_DB
-                .get_git_info(worktree_id, entry_id.to_proto() as i64, mtime_s, mtime_ns)
+        // Build a map from relative path to file info for quick lookup
+        let mut path_to_info: HashMap<String, (ProjectEntryId, i64, i64, i32)> = HashMap::new();
+        let mut uncached_paths: Vec<String> = Vec::new();
+
+        for (entry_id, file_path, worktree_id, mtime_s, mtime_ns) in &files {
+            let rel_path = file_path
+                .strip_prefix(&repo_path)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            // Check cache first
+            if let Ok(Some(timestamp)) =
+                CODE_ATLAS_DB.get_git_timestamp(*worktree_id, entry_id.to_proto() as i64, *mtime_s, *mtime_ns)
             {
                 on_result(GitResult {
-                    entry_id,
-                    timestamp,
-                    author,
-                    worktree_id,
-                    path: file_path.to_string_lossy().to_string(),
-                    mtime_s,
-                    mtime_ns,
+                    entry_id: *entry_id,
+                    timestamp: Some(timestamp),
                 });
                 continue;
             }
 
-            let relative_path = file_path.strip_prefix(&repo_path).unwrap_or(&file_path);
+            path_to_info.insert(rel_path.clone(), (*entry_id, *worktree_id, *mtime_s, *mtime_ns));
+            uncached_paths.push(rel_path);
+        }
 
-            match get_last_commit_info(&repo_path, relative_path).await {
-                Ok((timestamp, author)) => {
-                    // Cache result
-                    let _ = CODE_ATLAS_DB
-                        .save_git_info(
-                            worktree_id,
-                            entry_id.to_proto() as i64,
-                            file_path.to_string_lossy().to_string(),
-                            timestamp,
-                            author.clone(),
-                            mtime_s,
-                            mtime_ns,
-                        )
-                        .await;
+        if uncached_paths.is_empty() {
+            return;
+        }
 
+        // Get all file timestamps in one git command
+        // Format: timestamp\nfile1\nfile2\n\ntimestamp\nfile3\n...
+        // (empty line separates commits)
+        let output = Command::new("git")
+            .current_dir(&repo_path)
+            .args(["log", "--format=%at", "--name-only", "--diff-filter=ACMR"])
+            .output()
+            .await;
+
+        let Ok(output) = output else {
+            for rel_path in &uncached_paths {
+                if let Some((entry_id, _, _, _)) = path_to_info.get(rel_path) {
                     on_result(GitResult {
-                        entry_id,
-                        timestamp,
-                        author,
-                        worktree_id,
-                        path: file_path.to_string_lossy().to_string(),
-                        mtime_s,
-                        mtime_ns,
-                    });
-                }
-                Err(_) => {
-                    on_result(GitResult {
-                        entry_id,
+                        entry_id: *entry_id,
                         timestamp: None,
-                        author: None,
-                        worktree_id,
-                        path: file_path.to_string_lossy().to_string(),
-                        mtime_s,
-                        mtime_ns,
                     });
                 }
+            }
+            return;
+        };
+
+        if !output.status.success() {
+            for rel_path in &uncached_paths {
+                if let Some((entry_id, _, _, _)) = path_to_info.get(rel_path) {
+                    on_result(GitResult {
+                        entry_id: *entry_id,
+                        timestamp: None,
+                    });
+                }
+            }
+            return;
+        }
+
+        // Parse output format:
+        // timestamp
+        // <empty line>
+        // file1
+        // file2
+        // timestamp
+        // <empty line>
+        // file3
+        // ...
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut file_timestamps: HashMap<String, i64> = HashMap::new();
+
+        let mut current_timestamp: Option<i64> = None;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                // Empty line after timestamp - just skip it
+                continue;
+            }
+
+            // Try to parse as timestamp first
+            if let Ok(ts) = line.parse::<i64>() {
+                current_timestamp = Some(ts);
+            } else if let Some(ts) = current_timestamp {
+                // This is a file path - only record first occurrence (most recent)
+                file_timestamps.entry(line.to_string()).or_insert(ts);
+            }
+        }
+
+        // Report results and cache them
+        for rel_path in &uncached_paths {
+            if let Some((entry_id, worktree_id, mtime_s, mtime_ns)) = path_to_info.get(rel_path) {
+                let timestamp = file_timestamps.get(rel_path).copied();
+
+                // Cache the result
+                if let Some(ts) = timestamp {
+                    let _ = CODE_ATLAS_DB
+                        .save_git_timestamp(*worktree_id, entry_id.to_proto() as i64, ts, *mtime_s, *mtime_ns)
+                        .await;
+                }
+
+                on_result(GitResult {
+                    entry_id: *entry_id,
+                    timestamp,
+                });
             }
         }
     })

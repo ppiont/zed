@@ -263,12 +263,20 @@ impl CodeAtlas {
     }
 
     fn update_node_sizes(&mut self) {
-        for node in &mut self.root_nodes {
+        fn update_recursive(node: &mut TreemapNode, cache: &HashMap<ProjectEntryId, u64>) {
             if let NodeId::File(id) = node.id {
-                if let Some(&loc) = self.loc_cache.get(&id) {
+                if let Some(&loc) = cache.get(&id) {
                     node.size = loc;
                 }
             }
+            for child in &mut node.children {
+                update_recursive(child, cache);
+            }
+            node.compute_aggregate_size();
+        }
+
+        for node in &mut self.root_nodes {
+            update_recursive(node, &self.loc_cache);
         }
     }
 
@@ -277,20 +285,30 @@ impl CodeAtlas {
             return;
         }
 
+        fn collect_bounds(nodes: &[treemap::LayoutNode], result: &mut HashMap<NodeId, Bounds<Pixels>>) {
+            for node in nodes {
+                result.insert(node.id, node.bounds);
+                collect_bounds(&node.children, result);
+            }
+        }
+
         let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
-        let initial_bounds: HashMap<NodeId, Bounds<Pixels>> = layout_nodes
-            .iter()
-            .map(|node| (node.id, node.bounds))
-            .collect();
+        let mut initial_bounds = HashMap::new();
+        collect_bounds(&layout_nodes, &mut initial_bounds);
         self.animation.set_initial_bounds(initial_bounds);
     }
 
     fn update_animation_targets(&mut self, bounds: Bounds<Pixels>) {
+        fn collect_bounds(nodes: &[treemap::LayoutNode], result: &mut HashMap<NodeId, Bounds<Pixels>>) {
+            for node in nodes {
+                result.insert(node.id, node.bounds);
+                collect_bounds(&node.children, result);
+            }
+        }
+
         let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
-        let new_targets: HashMap<NodeId, Bounds<Pixels>> = layout_nodes
-            .iter()
-            .map(|node| (node.id, node.bounds))
-            .collect();
+        let mut new_targets = HashMap::new();
+        collect_bounds(&layout_nodes, &mut new_targets);
         self.animation.animate_to(new_targets);
     }
 
@@ -311,18 +329,38 @@ impl CodeAtlas {
     }
 
     fn collect_all_animated_bounds(&self) -> HashMap<NodeId, Bounds<Pixels>> {
-        self.root_nodes
-            .iter()
-            .filter_map(|node| {
-                self.animation
-                    .get_bounds(node.id)
-                    .map(|bounds| (node.id, bounds))
-            })
-            .collect()
+        fn collect_recursive(
+            nodes: &[TreemapNode],
+            animation: &AnimationState,
+            result: &mut HashMap<NodeId, Bounds<Pixels>>,
+        ) {
+            for node in nodes {
+                if let Some(bounds) = animation.get_bounds(node.id) {
+                    result.insert(node.id, bounds);
+                }
+                collect_recursive(&node.children, animation, result);
+            }
+        }
+
+        let mut result = HashMap::new();
+        collect_recursive(&self.root_nodes, &self.animation, &mut result);
+        result
     }
 
     fn get_node_details(&self, node_id: NodeId) -> Option<(String, u64, Option<i64>)> {
-        let node = self.root_nodes.iter().find(|n| n.id == node_id)?;
+        fn find_node(nodes: &[TreemapNode], id: NodeId) -> Option<&TreemapNode> {
+            for node in nodes {
+                if node.id == id {
+                    return Some(node);
+                }
+                if let Some(found) = find_node(&node.children, id) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let node = find_node(&self.root_nodes, node_id)?;
         let path = node.rel_path.to_string();
         let loc = node.size;
         let timestamp = match node_id {
@@ -562,22 +600,35 @@ impl CodeAtlas {
         let zoom = self.interaction.zoom;
         let pan = self.interaction.pan_offset;
 
-        for node in &layout_nodes {
-            let origin_x = node.bounds.origin.x * zoom + pan.x;
-            let origin_y = node.bounds.origin.y * zoom + pan.y;
-            let width = node.bounds.size.width * zoom;
-            let height = node.bounds.size.height * zoom;
+        fn find_recursive(
+            nodes: &[treemap::LayoutNode],
+            target_point: Point<Pixels>,
+            zoom: f32,
+            pan: Point<Pixels>,
+        ) -> Option<NodeId> {
+            for node in nodes {
+                let origin_x = node.bounds.origin.x * zoom + pan.x;
+                let origin_y = node.bounds.origin.y * zoom + pan.y;
+                let width = node.bounds.size.width * zoom;
+                let height = node.bounds.size.height * zoom;
 
-            let screen_bounds = Bounds::new(
-                gpui::point(origin_x, origin_y),
-                Size { width, height },
-            );
+                let screen_bounds = Bounds::new(
+                    gpui::point(origin_x, origin_y),
+                    Size { width, height },
+                );
 
-            if screen_bounds.contains(&target_point) {
-                return Some(node.id);
+                if screen_bounds.contains(&target_point) {
+                    // Check children first (they're drawn on top)
+                    if let Some(child_id) = find_recursive(&node.children, target_point, zoom, pan) {
+                        return Some(child_id);
+                    }
+                    return Some(node.id);
+                }
             }
+            None
         }
-        None
+
+        find_recursive(&layout_nodes, target_point, zoom, pan)
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -592,9 +643,17 @@ impl CodeAtlas {
     fn load_file_tree(project: &Entity<Project>, cx: &Context<Self>) -> Vec<TreemapNode> {
         let project = project.read(cx);
         let mut all_nodes = Vec::new();
+        let mut seen_worktrees = std::collections::HashSet::new();
 
         for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
+            let worktree_id = worktree.id();
+
+            // Skip if we've already processed this worktree
+            if !seen_worktrees.insert(worktree_id) {
+                continue;
+            }
+
             let snapshot = worktree.snapshot();
             let worktree_path = snapshot.abs_path();
 
@@ -751,49 +810,93 @@ impl Render for CodeAtlas {
                             let _ = shaped_line.paint(text_origin, line_height, window, cx);
                         }
 
-                        for node in &layout_nodes {
-                            let world_bounds = if animating {
-                                animated_bounds.get(&node.id).copied().unwrap_or(node.bounds)
-                            } else {
-                                node.bounds
-                            };
+                        fn paint_nodes(
+                            nodes: &[treemap::LayoutNode],
+                            window: &mut Window,
+                            cx: &mut App,
+                            vp: Bounds<Pixels>,
+                            zoom: f32,
+                            pan: Point<Pixels>,
+                            border_color: gpui::Hsla,
+                            git_cache: &HashMap<ProjectEntryId, i64>,
+                            animated_bounds: &HashMap<NodeId, Bounds<Pixels>>,
+                            animating: bool,
+                            paint_label: &impl Fn(&str, Bounds<Pixels>, &mut Window, &mut App),
+                        ) {
+                            for node in nodes {
+                                let world_bounds = if animating {
+                                    animated_bounds.get(&node.id).copied().unwrap_or(node.bounds)
+                                } else {
+                                    node.bounds
+                                };
 
-                            let origin_x = world_bounds.origin.x * zoom + pan_offset.x;
-                            let origin_y = world_bounds.origin.y * zoom + pan_offset.y;
-                            let width = world_bounds.size.width * zoom;
-                            let height = world_bounds.size.height * zoom;
+                                let origin_x = world_bounds.origin.x * zoom + pan.x;
+                                let origin_y = world_bounds.origin.y * zoom + pan.y;
+                                let width = world_bounds.size.width * zoom;
+                                let height = world_bounds.size.height * zoom;
 
-                            if origin_x > vp.size.width
-                                || origin_y > vp.size.height
-                                || origin_x + width < px(0.)
-                                || origin_y + height < px(0.)
-                            {
-                                continue;
-                            }
+                                if origin_x > vp.size.width
+                                    || origin_y > vp.size.height
+                                    || origin_x + width < px(0.)
+                                    || origin_y + height < px(0.)
+                                {
+                                    continue;
+                                }
 
-                            let screen_bounds =
-                                Bounds::new(point(origin_x, origin_y), Size { width, height });
+                                let screen_bounds =
+                                    Bounds::new(point(origin_x, origin_y), Size { width, height });
 
-                            let bg = if let NodeId::File(id) = node.id {
-                                let timestamp = git_cache.get(&id).copied();
-                                activity_color(timestamp, cx)
-                            } else {
-                                gpui::white()
-                            };
+                                // Only draw files (directories are just containers)
+                                if let NodeId::File(id) = node.id {
+                                    let timestamp = git_cache.get(&id).copied();
+                                    let bg = activity_color(timestamp, cx);
 
-                            window.paint_quad(quad(
-                                screen_bounds,
-                                px(2.),
-                                bg,
-                                gpui::Edges::all(px(1.)),
-                                border_color,
-                                BorderStyle::Solid,
-                            ));
+                                    window.paint_quad(quad(
+                                        screen_bounds,
+                                        px(2.),
+                                        bg,
+                                        gpui::Edges::all(px(1.)),
+                                        border_color,
+                                        BorderStyle::Solid,
+                                    ));
 
-                            if should_show_label(screen_bounds) {
-                                paint_label(&node.name, screen_bounds, window, cx);
+                                    if should_show_label(screen_bounds) {
+                                        paint_label(&node.name, screen_bounds, window, cx);
+                                    }
+                                }
+
+                                // Recurse into children
+                                if !node.children.is_empty() {
+                                    paint_nodes(
+                                        &node.children,
+                                        window,
+                                        cx,
+                                        vp,
+                                        zoom,
+                                        pan,
+                                        border_color,
+                                        git_cache,
+                                        animated_bounds,
+                                        animating,
+                                        paint_label,
+                                    );
+                                }
                             }
                         }
+
+                        paint_nodes(
+                            &layout_nodes,
+                            window,
+                            cx,
+                            vp,
+                            zoom,
+                            pan_offset,
+                            border_color,
+                            &git_cache,
+                            &animated_bounds,
+                            animating,
+                            &paint_label,
+                        );
                     },
                 )
                 .size_full(),

@@ -1,5 +1,6 @@
 use gpui::{Bounds, Pixels};
 use project::ProjectEntryId;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use worktree::Entry;
@@ -84,13 +85,14 @@ pub enum NodeId {
     Directory(ProjectEntryId),
 }
 
-/// A node in the treemap (files only, flat layout)
+/// A node in the treemap (hierarchical)
 #[derive(Clone, Debug)]
 pub struct TreemapNode {
     pub id: NodeId,
     pub rel_path: Arc<str>,
     pub name: String,
     pub size: u64,
+    pub children: Vec<TreemapNode>,
     #[allow(dead_code)]
     pub bounds: Bounds<Pixels>,
 }
@@ -105,11 +107,26 @@ impl TreemapNode {
             .unwrap_or_else(|| rel_path_str.clone());
 
         Self {
-            id: NodeId::File(entry.id),
+            id: if entry.is_file() {
+                NodeId::File(entry.id)
+            } else {
+                NodeId::Directory(entry.id)
+            },
             rel_path: rel_path_str.into(),
             name,
             size: entry.size,
+            children: Vec::new(),
             bounds: Bounds::default(),
+        }
+    }
+
+    pub fn is_directory(&self) -> bool {
+        matches!(self.id, NodeId::Directory(_))
+    }
+
+    pub fn compute_aggregate_size(&mut self) {
+        if !self.children.is_empty() {
+            self.size = self.children.iter().map(|c| c.size).sum();
         }
     }
 
@@ -118,13 +135,98 @@ impl TreemapNode {
     }
 }
 
-/// Builds a flat list of file nodes for the treemap (no directory nesting)
+/// Builds hierarchical tree from flat file entries
 pub fn build_tree(entries: impl Iterator<Item = Entry>, _worktree_path: &Path) -> Vec<TreemapNode> {
-    entries
-        .filter(should_include_entry)
-        .filter(|e| e.is_file())
-        .map(|entry| TreemapNode::from_entry(&entry))
-        .collect()
+    use std::collections::HashSet;
+
+    let mut files_by_parent: HashMap<String, HashMap<String, Entry>> = HashMap::new();
+    let mut directories: HashMap<String, Entry> = HashMap::new();
+    let mut children_by_parent: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_dir_paths: HashSet<String> = HashSet::new();
+
+    for entry in entries.filter(should_include_entry) {
+        let path_str = entry.path.as_unix_str().to_string();
+        if entry.is_dir() {
+            let parent = entry
+                .path
+                .parent()
+                .map(|p| p.as_unix_str().to_string())
+                .unwrap_or_default();
+            children_by_parent
+                .entry(parent)
+                .or_default()
+                .insert(path_str.clone());
+            all_dir_paths.insert(path_str.clone());
+            directories.insert(path_str, entry);
+        } else {
+            let parent = entry
+                .path
+                .parent()
+                .map(|p| p.as_unix_str().to_string())
+                .unwrap_or_default();
+            files_by_parent
+                .entry(parent)
+                .or_default()
+                .insert(path_str, entry);
+        }
+    }
+
+    // Sort directories by depth (deepest first)
+    let mut all_dir_paths: Vec<String> = all_dir_paths.into_iter().collect();
+    all_dir_paths.sort_by(|a, b| {
+        let depth_a = a.matches('/').count();
+        let depth_b = b.matches('/').count();
+        depth_b.cmp(&depth_a)
+    });
+
+    // Build nodes bottom-up
+    let mut built_nodes: HashMap<String, Vec<TreemapNode>> = HashMap::new();
+
+    for dir_path in &all_dir_paths {
+        let mut children = Vec::new();
+
+        if let Some(files) = files_by_parent.get(dir_path) {
+            for entry in files.values() {
+                children.push(TreemapNode::from_entry(entry));
+            }
+        }
+
+        if let Some(child_dir_paths) = children_by_parent.get(dir_path) {
+            for child_path in child_dir_paths {
+                if let Some(mut child_nodes) = built_nodes.remove(child_path) {
+                    children.append(&mut child_nodes);
+                }
+            }
+        }
+
+        if let Some(dir_entry) = directories.get(dir_path) {
+            let mut dir_node = TreemapNode::from_entry(dir_entry);
+            dir_node.children = children;
+            dir_node.compute_aggregate_size();
+            if dir_node.size > 0 {
+                let parent = dir_entry
+                    .path
+                    .parent()
+                    .map(|p| p.as_unix_str().to_string())
+                    .unwrap_or_default();
+                built_nodes.entry(parent).or_default().push(dir_node);
+            }
+        }
+    }
+
+    let mut root_nodes = Vec::new();
+
+    if let Some(files) = files_by_parent.get("") {
+        for entry in files.values() {
+            root_nodes.push(TreemapNode::from_entry(entry));
+        }
+    }
+
+    if let Some(root_dir_nodes) = built_nodes.remove("") {
+        root_nodes.extend(root_dir_nodes);
+    }
+
+    root_nodes
 }
 
 
