@@ -1,3 +1,4 @@
+mod animation;
 mod colors;
 mod data;
 mod git_worker;
@@ -7,6 +8,7 @@ mod lod;
 mod persistence;
 mod treemap;
 
+use animation::AnimationState;
 use colors::activity_color;
 use data::{build_tree, NodeId, TreemapNode};
 use git_worker::{spawn_git_worker, GitResult};
@@ -43,6 +45,7 @@ pub struct CodeAtlas {
     interaction: InteractionState,
     loc_cache: HashMap<ProjectEntryId, u64>,
     git_cache: HashMap<ProjectEntryId, i64>,
+    animation: AnimationState,
     #[allow(dead_code)]
     loc_loading: bool,
     #[allow(dead_code)]
@@ -64,6 +67,7 @@ impl CodeAtlas {
             interaction: InteractionState::default(),
             loc_cache: HashMap::new(),
             git_cache: HashMap::new(),
+            animation: AnimationState::default(),
             loc_loading: true,
             loc_task: None,
             git_task: None,
@@ -116,11 +120,23 @@ impl CodeAtlas {
 
             while let Ok(results) = rx.recv().await {
                 let _ = weak_self.update(cx, |this, cx| {
+                    // Capture initial layout BEFORE updating sizes (for animation)
+                    if let Some(bounds) = this.last_layout_bounds.get() {
+                        this.capture_initial_bounds_if_needed(bounds);
+                    }
+
+                    // Update loc cache and node sizes
                     for result in &results {
                         this.loc_cache.insert(result.entry_id, result.loc);
                     }
                     this.update_node_sizes();
                     this.loc_loading = false;
+
+                    // Trigger animation to new layout
+                    if let Some(bounds) = this.last_layout_bounds.get() {
+                        this.update_animation_targets(bounds);
+                        this.schedule_animation_frame(cx);
+                    }
                     cx.notify();
                 });
             }
@@ -252,6 +268,82 @@ impl CodeAtlas {
         for node in &mut self.root_nodes {
             update_recursive(node, &self.loc_cache);
         }
+    }
+
+    fn capture_initial_bounds_if_needed(&mut self, bounds: Bounds<Pixels>) {
+        if self.animation.has_initial_bounds() {
+            return;
+        }
+
+        fn collect_bounds(
+            nodes: &[treemap::RecursiveLayoutNode],
+            result: &mut HashMap<NodeId, Bounds<Pixels>>,
+        ) {
+            for node in nodes {
+                result.insert(node.id, node.bounds);
+                collect_bounds(&node.children, result);
+            }
+        }
+
+        // Capture the current layout (with file sizes, before LOC loads)
+        let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
+        let mut initial_bounds = HashMap::new();
+        collect_bounds(&layout_nodes, &mut initial_bounds);
+        self.animation.set_initial_bounds(initial_bounds);
+    }
+
+    fn update_animation_targets(&mut self, bounds: Bounds<Pixels>) {
+        fn collect_bounds(
+            nodes: &[treemap::RecursiveLayoutNode],
+            result: &mut HashMap<NodeId, Bounds<Pixels>>,
+        ) {
+            for node in nodes {
+                result.insert(node.id, node.bounds);
+                collect_bounds(&node.children, result);
+            }
+        }
+
+        // Compute the NEW layout with updated sizes
+        let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
+        let mut new_targets = HashMap::new();
+        collect_bounds(&layout_nodes, &mut new_targets);
+
+        self.animation.animate_to(new_targets);
+    }
+
+    fn schedule_animation_frame(&self, cx: &mut Context<Self>) {
+        if self.animation.animating {
+            cx.spawn(async move |this, cx| {
+                smol::Timer::after(std::time::Duration::from_millis(16)).await;
+
+                let _ = this.update(cx, |this, cx| {
+                    if this.animation.update() {
+                        this.schedule_animation_frame(cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn collect_all_animated_bounds(&self) -> HashMap<NodeId, Bounds<Pixels>> {
+        fn collect_recursive(
+            nodes: &[TreemapNode],
+            animation: &AnimationState,
+            result: &mut HashMap<NodeId, Bounds<Pixels>>,
+        ) {
+            for node in nodes {
+                if let Some(bounds) = animation.get_bounds(node.id) {
+                    result.insert(node.id, bounds);
+                }
+                collect_recursive(&node.children, animation, result);
+            }
+        }
+
+        let mut result = HashMap::new();
+        collect_recursive(&self.root_nodes, &self.animation, &mut result);
+        result
     }
 
     fn on_mouse_down(
@@ -443,18 +535,23 @@ impl Render for CodeAtlas {
         let dir_color = cx.theme().colors().surface_background; // Transparent/bg for directories
         let zoom = self.interaction.zoom;
         let pan_offset = self.interaction.pan_offset;
-        
+
         // Clone root nodes for layout closure
-        // Note: cloning the tree structure is relatively cheap (Arc path, strings, etc) compared to layout
         let root_nodes = self.root_nodes.clone();
-        
-        // Clone git cache for paint closure (expensive? 50k items map)
-        // Optimization: Use ID-based lookup or shared immutable reference via Arc/Rc?
-        // Cloning HashMap of i64 is okay-ish but not ideal every frame.
-        // For now, let's clone.
+
+        // Clone git cache for paint closure
         let git_cache = self.git_cache.clone();
 
         let last_layout_bounds = self.last_layout_bounds.clone();
+
+        // Capture current animated bounds for this frame
+        let animating = self.animation.animating;
+        let animated_bounds: HashMap<NodeId, Bounds<Pixels>> = if animating {
+            // Collect current animated bounds for all nodes
+            self.collect_all_animated_bounds()
+        } else {
+            HashMap::new()
+        };
 
         div()
             .size_full()
@@ -544,13 +641,22 @@ impl Render for CodeAtlas {
                             dir_color: gpui::Hsla,
                             border_color: gpui::Hsla,
                             git_cache: &HashMap<ProjectEntryId, i64>,
+                            animated_bounds: &HashMap<NodeId, Bounds<Pixels>>,
+                            animating: bool,
                         ) {
                             for node in nodes {
+                                // Use animated bounds if available and animating
+                                let world_bounds = if animating {
+                                    animated_bounds.get(&node.id).copied().unwrap_or(node.bounds)
+                                } else {
+                                    node.bounds
+                                };
+
                                 // Apply transforms
-                                let origin_x = node.bounds.origin.x * zoom + pan.x;
-                                let origin_y = node.bounds.origin.y * zoom + pan.y;
-                                let width = node.bounds.size.width * zoom;
-                                let height = node.bounds.size.height * zoom;
+                                let origin_x = world_bounds.origin.x * zoom + pan.x;
+                                let origin_y = world_bounds.origin.y * zoom + pan.y;
+                                let width = world_bounds.size.width * zoom;
+                                let height = world_bounds.size.height * zoom;
 
                                 // Cull
                                 if origin_x > vp.size.width
@@ -612,6 +718,8 @@ impl Render for CodeAtlas {
                                         dir_color,
                                         border_color,
                                         git_cache,
+                                        animated_bounds,
+                                        animating,
                                     );
                                 }
                             }
@@ -627,6 +735,8 @@ impl Render for CodeAtlas {
                             dir_color,
                             border_color,
                             &git_cache,
+                            &animated_bounds,
+                            animating,
                         );
                     },
                 )
