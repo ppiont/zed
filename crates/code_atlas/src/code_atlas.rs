@@ -15,16 +15,17 @@ use git_worker::{spawn_git_worker, GitResult};
 use gpui::{
     actions, canvas, div, point, px, quad, App, Bounds, BorderStyle, Context, Entity,
     EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Point, Render, ScrollWheelEvent, SharedString, Size, Task,
-    TextRun, WeakEntity, Window,
+    MouseMoveEvent, MouseUpEvent, Point, Render, ScrollWheelEvent, SharedString, Size,
+    Subscription, Task, TextRun, WeakEntity, Window,
 };
-use lod::{label_font_size, label_opacity, should_show_label};
 use interaction::InteractionState;
 use loc_worker::{spawn_loc_worker, LocResult};
-use project::{Project, ProjectEntryId};
+use lod::{label_font_size, label_opacity, should_show_label};
+use project::{Event as ProjectEvent, Project, ProjectEntryId};
 use std::collections::HashMap;
 use theme::ActiveTheme;
 use ui::{prelude::*, Icon, IconName};
+use worktree::PathChange;
 use workspace::item::ItemEvent;
 use workspace::{Item, Workspace};
 
@@ -53,11 +54,17 @@ pub struct CodeAtlas {
     #[allow(dead_code)]
     git_task: Option<Task<()>>,
     last_layout_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    hovered_node: Option<NodeId>,
+    #[allow(dead_code)]
+    _project_subscription: Subscription,
+    pending_layout_update: Option<Task<()>>,
 }
 
 impl CodeAtlas {
     pub fn new(project: Entity<Project>, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let root_nodes = Self::load_file_tree(&project, cx);
+
+        let subscription = cx.subscribe(&project, Self::on_project_event);
 
         let mut atlas = Self {
             project,
@@ -72,6 +79,9 @@ impl CodeAtlas {
             loc_task: None,
             git_task: None,
             last_layout_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            hovered_node: None,
+            _project_subscription: subscription,
+            pending_layout_update: None,
         };
 
         atlas.start_loc_loading(cx);
@@ -253,20 +263,12 @@ impl CodeAtlas {
     }
 
     fn update_node_sizes(&mut self) {
-        fn update_recursive(node: &mut TreemapNode, cache: &HashMap<ProjectEntryId, u64>) {
+        for node in &mut self.root_nodes {
             if let NodeId::File(id) = node.id {
-                if let Some(&loc) = cache.get(&id) {
+                if let Some(&loc) = self.loc_cache.get(&id) {
                     node.size = loc;
                 }
             }
-            for child in &mut node.children {
-                update_recursive(child, cache);
-            }
-            node.compute_aggregate_size();
-        }
-
-        for node in &mut self.root_nodes {
-            update_recursive(node, &self.loc_cache);
         }
     }
 
@@ -275,39 +277,20 @@ impl CodeAtlas {
             return;
         }
 
-        fn collect_bounds(
-            nodes: &[treemap::RecursiveLayoutNode],
-            result: &mut HashMap<NodeId, Bounds<Pixels>>,
-        ) {
-            for node in nodes {
-                result.insert(node.id, node.bounds);
-                collect_bounds(&node.children, result);
-            }
-        }
-
-        // Capture the current layout (with file sizes, before LOC loads)
         let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
-        let mut initial_bounds = HashMap::new();
-        collect_bounds(&layout_nodes, &mut initial_bounds);
+        let initial_bounds: HashMap<NodeId, Bounds<Pixels>> = layout_nodes
+            .iter()
+            .map(|node| (node.id, node.bounds))
+            .collect();
         self.animation.set_initial_bounds(initial_bounds);
     }
 
     fn update_animation_targets(&mut self, bounds: Bounds<Pixels>) {
-        fn collect_bounds(
-            nodes: &[treemap::RecursiveLayoutNode],
-            result: &mut HashMap<NodeId, Bounds<Pixels>>,
-        ) {
-            for node in nodes {
-                result.insert(node.id, node.bounds);
-                collect_bounds(&node.children, result);
-            }
-        }
-
-        // Compute the NEW layout with updated sizes
         let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
-        let mut new_targets = HashMap::new();
-        collect_bounds(&layout_nodes, &mut new_targets);
-
+        let new_targets: HashMap<NodeId, Bounds<Pixels>> = layout_nodes
+            .iter()
+            .map(|node| (node.id, node.bounds))
+            .collect();
         self.animation.animate_to(new_targets);
     }
 
@@ -328,22 +311,25 @@ impl CodeAtlas {
     }
 
     fn collect_all_animated_bounds(&self) -> HashMap<NodeId, Bounds<Pixels>> {
-        fn collect_recursive(
-            nodes: &[TreemapNode],
-            animation: &AnimationState,
-            result: &mut HashMap<NodeId, Bounds<Pixels>>,
-        ) {
-            for node in nodes {
-                if let Some(bounds) = animation.get_bounds(node.id) {
-                    result.insert(node.id, bounds);
-                }
-                collect_recursive(&node.children, animation, result);
-            }
-        }
+        self.root_nodes
+            .iter()
+            .filter_map(|node| {
+                self.animation
+                    .get_bounds(node.id)
+                    .map(|bounds| (node.id, bounds))
+            })
+            .collect()
+    }
 
-        let mut result = HashMap::new();
-        collect_recursive(&self.root_nodes, &self.animation, &mut result);
-        result
+    fn get_node_details(&self, node_id: NodeId) -> Option<(String, u64, Option<i64>)> {
+        let node = self.root_nodes.iter().find(|n| n.id == node_id)?;
+        let path = node.rel_path.to_string();
+        let loc = node.size;
+        let timestamp = match node_id {
+            NodeId::File(entry_id) => self.git_cache.get(&entry_id).copied(),
+            NodeId::Directory(_) => None,
+        };
+        Some((path, loc, timestamp))
     }
 
     fn on_mouse_down(
@@ -366,7 +352,14 @@ impl CodeAtlas {
     ) {
         if self.interaction.is_panning {
             self.interaction.update_pan(event.position);
+            self.hovered_node = None;
             cx.notify();
+        } else if let Some(bounds) = self.last_layout_bounds.get() {
+            let new_hover = self.find_node_at_point(event.position, bounds);
+            if new_hover != self.hovered_node {
+                self.hovered_node = new_hover;
+                cx.notify();
+            }
         }
     }
 
@@ -383,36 +376,7 @@ impl CodeAtlas {
                 if let Some(bounds) = self.last_layout_bounds.get() {
                     if let Some(node_id) = self.find_node_at_point(event.position, bounds) {
                         if let NodeId::File(entry_id) = node_id {
-                            if let Some(workspace) = self.workspace.upgrade() {
-                                let project = self.project.read(cx);
-                                let worktrees: Vec<_> = project.visible_worktrees(cx).collect();
-                                let mut target = None;
-
-                                for worktree in worktrees {
-                                    let worktree_read = worktree.read(cx);
-                                    if let Some(entry) = worktree_read.entry_for_id(entry_id) {
-                                        target = Some((worktree_read.id(), entry.path.clone()));
-                                        break;
-                                    }
-                                }
-
-                                if let Some((worktree_id, path)) = target {
-                                    let project_path = project::ProjectPath {
-                                        worktree_id,
-                                        path,
-                                    };
-
-                                    workspace.update(cx, |workspace, cx| {
-                                        workspace.open_path(
-                                            project_path,
-                                            None,
-                                            true,
-                                            window,
-                                            cx
-                                        ).detach();
-                                    });
-                                }
-                            }
+                            self.handle_file_click(entry_id, event.click_count, window, cx);
                         }
                     }
                 }
@@ -421,45 +385,199 @@ impl CodeAtlas {
         }
     }
 
-    fn find_node_at_point(&self, target_point: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<NodeId> {
-        // Re-run layout logic to find the node with the same LOD as rendered
-        let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
-        
-        fn find_recursive(
-            nodes: &[treemap::RecursiveLayoutNode], 
-            target_point: Point<Pixels>,
-            zoom: f32,
-            pan: Point<Pixels>
-        ) -> Option<NodeId> {
-            for node in nodes {
-                 let origin_x = node.bounds.origin.x * zoom + pan.x;
-                 let origin_y = node.bounds.origin.y * zoom + pan.y;
-                 let width = node.bounds.size.width * zoom;
-                 let height = node.bounds.size.height * zoom;
-                 
-                 let screen_bounds = Bounds::new(
-                     gpui::point(origin_x, origin_y),
-                     Size { width, height }
-                 );
-                 
-                 if screen_bounds.contains(&target_point) {
-                     // Check children first (top-down, but visually children are inside)
-                     if let Some(id) = find_recursive(&node.children, target_point, zoom, pan) {
-                         return Some(id);
-                     }
-                     // If no children matched (or leaf), return this node
-                     return Some(node.id);
-                 }
+    fn handle_file_click(
+        &self,
+        entry_id: ProjectEntryId,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = self.project.read(cx);
+
+        let mut target = None;
+        for worktree in project.visible_worktrees(cx) {
+            let worktree_read = worktree.read(cx);
+            if let Some(entry) = worktree_read.entry_for_id(entry_id) {
+                target = Some((worktree_read.id(), entry.path.clone()));
+                break;
             }
-            None
         }
 
-        find_recursive(
-            &layout_nodes, 
-            target_point, 
-            self.interaction.zoom, 
-            self.interaction.pan_offset
-        )
+        if let Some((worktree_id, path)) = target {
+            let project_path = project::ProjectPath { worktree_id, path };
+            // Single-click = preview tab, double-click = permanent tab
+            let allow_preview = click_count == 1;
+
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .open_path_preview(
+                        project_path,
+                        None,          // pane
+                        true,          // focus_item
+                        allow_preview, // allow_preview
+                        true,          // activate
+                        window,
+                        cx,
+                    )
+                    .detach();
+            });
+        }
+    }
+
+    fn on_project_event(
+        &mut self,
+        _project: Entity<Project>,
+        event: &ProjectEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ProjectEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                self.handle_file_changes(*worktree_id, changes, cx);
+            }
+            ProjectEvent::WorktreeAdded(_) | ProjectEvent::WorktreeRemoved(_) => {
+                self.reload_file_tree(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_file_changes(
+        &mut self,
+        worktree_id: worktree::WorktreeId,
+        changes: &worktree::UpdatedEntriesSet,
+        cx: &mut Context<Self>,
+    ) {
+        let mut needs_layout = false;
+        let mut files_to_recount = Vec::new();
+
+        for (_path, entry_id, change) in changes.iter() {
+            match change {
+                PathChange::Added | PathChange::AddedOrUpdated => {
+                    needs_layout = true;
+                }
+                PathChange::Removed => {
+                    self.loc_cache.remove(entry_id);
+                    self.git_cache.remove(entry_id);
+                    needs_layout = true;
+                }
+                PathChange::Updated => {
+                    self.loc_cache.remove(entry_id);
+                    needs_layout = true;
+
+                    if let Some(full_path) = self.get_entry_path(*entry_id, worktree_id, cx) {
+                        files_to_recount.push((*entry_id, full_path));
+                    }
+                }
+                PathChange::Loaded => {}
+            }
+        }
+
+        if !files_to_recount.is_empty() {
+            self.queue_loc_updates(files_to_recount, cx);
+        }
+
+        if needs_layout {
+            self.schedule_layout_update(cx);
+        }
+    }
+
+    fn get_entry_path(
+        &self,
+        entry_id: ProjectEntryId,
+        worktree_id: worktree::WorktreeId,
+        cx: &Context<Self>,
+    ) -> Option<std::path::PathBuf> {
+        let project = self.project.read(cx);
+        for worktree in project.visible_worktrees(cx) {
+            let wt = worktree.read(cx);
+            if wt.id() == worktree_id {
+                if let Some(entry) = wt.entry_for_id(entry_id) {
+                    return Some(wt.abs_path().join(entry.path.as_unix_str()));
+                }
+            }
+        }
+        None
+    }
+
+    fn schedule_layout_update(&mut self, cx: &mut Context<Self>) {
+        self.pending_layout_update.take();
+
+        self.pending_layout_update = Some(cx.spawn(async move |this, cx| {
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+
+            let _ = this.update(cx, |this, cx| {
+                if let Some(bounds) = this.last_layout_bounds.get() {
+                    this.capture_initial_bounds_if_needed(bounds);
+                }
+
+                this.root_nodes = Self::load_file_tree(&this.project, cx);
+                this.update_node_sizes();
+
+                if let Some(bounds) = this.last_layout_bounds.get() {
+                    this.update_animation_targets(bounds);
+                    this.schedule_animation_frame(cx);
+                }
+
+                cx.notify();
+            });
+        }));
+    }
+
+    fn reload_file_tree(&mut self, cx: &mut Context<Self>) {
+        self.root_nodes = Self::load_file_tree(&self.project, cx);
+        self.update_node_sizes();
+
+        self.start_loc_loading(cx);
+        self.start_git_loading(cx);
+
+        cx.notify();
+    }
+
+    fn queue_loc_updates(
+        &mut self,
+        files: Vec<(ProjectEntryId, std::path::PathBuf)>,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_self = cx.weak_entity();
+
+        cx.spawn(async move |_this, cx| {
+            for (entry_id, path) in files {
+                if let Ok(loc) = loc_worker::count_lines(&path) {
+                    let _ = weak_self.update(cx, |this, cx| {
+                        this.loc_cache.insert(entry_id, loc);
+                        this.update_node_sizes();
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn find_node_at_point(&self, target_point: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<NodeId> {
+        let layout_nodes = treemap::layout_tree(&self.root_nodes, bounds, self.interaction.zoom);
+        let zoom = self.interaction.zoom;
+        let pan = self.interaction.pan_offset;
+
+        for node in &layout_nodes {
+            let origin_x = node.bounds.origin.x * zoom + pan.x;
+            let origin_y = node.bounds.origin.y * zoom + pan.y;
+            let width = node.bounds.size.width * zoom;
+            let height = node.bounds.size.height * zoom;
+
+            let screen_bounds = Bounds::new(
+                gpui::point(origin_x, origin_y),
+                Size { width, height },
+            );
+
+            if screen_bounds.contains(&target_point) {
+                return Some(node.id);
+            }
+        }
+        None
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -532,7 +650,6 @@ impl Render for CodeAtlas {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().colors().surface_background;
         let border_color = cx.theme().colors().border;
-        let dir_color = cx.theme().colors().surface_background; // Transparent/bg for directories
         let zoom = self.interaction.zoom;
         let pan_offset = self.interaction.pan_offset;
 
@@ -552,6 +669,9 @@ impl Render for CodeAtlas {
         } else {
             HashMap::new()
         };
+
+        // Get hovered node details for tooltip
+        let hovered_details = self.hovered_node.and_then(|id| self.get_node_details(id));
 
         div()
             .size_full()
@@ -631,117 +751,102 @@ impl Render for CodeAtlas {
                             let _ = shaped_line.paint(text_origin, line_height, window, cx);
                         }
 
-                        fn paint_recursive(
-                            nodes: Vec<treemap::RecursiveLayoutNode>,
-                            window: &mut Window,
-                            cx: &mut App,
-                            vp: Bounds<Pixels>,
-                            zoom: f32,
-                            pan: Point<Pixels>,
-                            dir_color: gpui::Hsla,
-                            border_color: gpui::Hsla,
-                            git_cache: &HashMap<ProjectEntryId, i64>,
-                            animated_bounds: &HashMap<NodeId, Bounds<Pixels>>,
-                            animating: bool,
-                        ) {
-                            for node in nodes {
-                                // Use animated bounds if available and animating
-                                let world_bounds = if animating {
-                                    animated_bounds.get(&node.id).copied().unwrap_or(node.bounds)
-                                } else {
-                                    node.bounds
-                                };
+                        for node in &layout_nodes {
+                            let world_bounds = if animating {
+                                animated_bounds.get(&node.id).copied().unwrap_or(node.bounds)
+                            } else {
+                                node.bounds
+                            };
 
-                                // Apply transforms
-                                let origin_x = world_bounds.origin.x * zoom + pan.x;
-                                let origin_y = world_bounds.origin.y * zoom + pan.y;
-                                let width = world_bounds.size.width * zoom;
-                                let height = world_bounds.size.height * zoom;
+                            let origin_x = world_bounds.origin.x * zoom + pan_offset.x;
+                            let origin_y = world_bounds.origin.y * zoom + pan_offset.y;
+                            let width = world_bounds.size.width * zoom;
+                            let height = world_bounds.size.height * zoom;
 
-                                // Cull
-                                if origin_x > vp.size.width
-                                    || origin_y > vp.size.height
-                                    || origin_x + width < px(0.)
-                                    || origin_y + height < px(0.)
-                                {
-                                    continue;
-                                }
+                            if origin_x > vp.size.width
+                                || origin_y > vp.size.height
+                                || origin_x + width < px(0.)
+                                || origin_y + height < px(0.)
+                            {
+                                continue;
+                            }
 
-                                let screen_bounds =
-                                    Bounds::new(point(origin_x, origin_y), Size { width, height });
+                            let screen_bounds =
+                                Bounds::new(point(origin_x, origin_y), Size { width, height });
 
-                                // Determine node type
-                                let is_file = matches!(node.id, NodeId::File(_));
-                                let is_collapsed_dir =
-                                    matches!(node.id, NodeId::Directory(_)) && node.children.is_empty();
+                            let bg = if let NodeId::File(id) = node.id {
+                                let timestamp = git_cache.get(&id).copied();
+                                activity_color(timestamp, cx)
+                            } else {
+                                gpui::white()
+                            };
 
-                                // Determine background color
-                                let bg = if is_file {
-                                    if let NodeId::File(id) = node.id {
-                                        let timestamp = git_cache.get(&id).copied();
-                                        activity_color(timestamp, cx)
-                                    } else {
-                                        gpui::white()
-                                    }
-                                } else if is_collapsed_dir {
-                                    // Collapsed directory - use element_background for distinction
-                                    cx.theme().colors().element_background
-                                } else {
-                                    dir_color
-                                };
+                            window.paint_quad(quad(
+                                screen_bounds,
+                                px(2.),
+                                bg,
+                                gpui::Edges::all(px(1.)),
+                                border_color,
+                                BorderStyle::Solid,
+                            ));
 
-                                // Draw rectangle with corner radius for visual polish
-                                window.paint_quad(quad(
-                                    screen_bounds,
-                                    px(2.), // Corner radius
-                                    bg,
-                                    gpui::Edges::all(px(1.)),
-                                    border_color,
-                                    BorderStyle::Solid,
-                                ));
-
-                                // Draw label if large enough (only for files and collapsed directories)
-                                if (is_file || is_collapsed_dir) && should_show_label(screen_bounds)
-                                {
-                                    paint_label(&node.name, screen_bounds, window, cx);
-                                }
-
-                                // Recurse into children
-                                if !node.children.is_empty() {
-                                    paint_recursive(
-                                        node.children,
-                                        window,
-                                        cx,
-                                        vp,
-                                        zoom,
-                                        pan,
-                                        dir_color,
-                                        border_color,
-                                        git_cache,
-                                        animated_bounds,
-                                        animating,
-                                    );
-                                }
+                            if should_show_label(screen_bounds) {
+                                paint_label(&node.name, screen_bounds, window, cx);
                             }
                         }
-
-                        paint_recursive(
-                            layout_nodes,
-                            window,
-                            cx,
-                            vp,
-                            zoom,
-                            pan_offset,
-                            dir_color,
-                            border_color,
-                            &git_cache,
-                            &animated_bounds,
-                            animating,
-                        );
                     },
                 )
                 .size_full(),
             )
+            .when_some(hovered_details, |container, (path, loc, timestamp)| {
+                let days_ago = timestamp.map(|ts| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (now - ts) / 86400
+                });
+
+                container.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .left_2()
+                        .bg(cx.theme().colors().elevated_surface_background)
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .rounded_md()
+                        .shadow_md()
+                        .p_2()
+                        .max_w(px(400.))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().colors().text)
+                                .child(path),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child(format!("{} lines", loc)),
+                        )
+                        .when_some(days_ago, |tooltip, days| {
+                            tooltip.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(if days == 0 {
+                                        "Modified today".to_string()
+                                    } else if days == 1 {
+                                        "Modified yesterday".to_string()
+                                    } else {
+                                        format!("Modified {} days ago", days)
+                                    }),
+                            )
+                        }),
+                )
+            })
     }
 }
 

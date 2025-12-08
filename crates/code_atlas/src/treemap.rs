@@ -2,28 +2,24 @@ use gpui::{px, Bounds, Pixels, Point, Size};
 use streemap::Rect;
 
 use crate::data::{NodeId, TreemapNode};
-use crate::lod::should_expand;
 
 #[derive(Debug)]
-pub struct RecursiveLayoutNode {
+pub struct LayoutNode {
     pub id: NodeId,
     pub name: String,
     pub bounds: Bounds<Pixels>,
-    pub children: Vec<RecursiveLayoutNode>,
 }
 
-/// Recursively computes layout for a list of nodes using the streemap crate
-/// The zoom parameter is used to calculate screen-space bounds for LOD decisions
+/// Computes flat layout for file nodes using the squarified treemap algorithm
 pub fn layout_tree(
     nodes: &[TreemapNode],
     bounds: Bounds<Pixels>,
-    zoom: f32,
-) -> Vec<RecursiveLayoutNode> {
+    _zoom: f32,
+) -> Vec<LayoutNode> {
     if nodes.is_empty() {
         return Vec::new();
     }
 
-    // Filter nodes with positive size and create items for streemap
     let mut items: Vec<(usize, f64, Rect<f64>)> = nodes
         .iter()
         .enumerate()
@@ -46,7 +42,6 @@ pub fn layout_tree(
         return Vec::new();
     }
 
-    // Create bounds rect for streemap
     let streemap_bounds = Rect {
         x: f64::from(bounds.origin.x),
         y: f64::from(bounds.origin.y),
@@ -54,7 +49,6 @@ pub fn layout_tree(
         h: f64::from(bounds.size.height),
     };
 
-    // Run the squarified treemap algorithm
     streemap::squarify(
         streemap_bounds,
         &mut items[..],
@@ -62,60 +56,23 @@ pub fn layout_tree(
         |(_, _, item_rect), r| *item_rect = r,
     );
 
-    // Convert results back to our format
-    let mut recursive_layout = Vec::with_capacity(items.len());
-
-    for (idx, _, item_rect) in &items {
-        let node = &nodes[*idx];
-
-        let gpui_bounds = Bounds::new(
-            Point::new(px(item_rect.x as f32), px(item_rect.y as f32)),
-            Size {
-                width: px(item_rect.w as f32),
-                height: px(item_rect.h as f32),
-            },
-        );
-
-        // Calculate screen bounds for LOD decision (world bounds * zoom)
-        let width: f32 = gpui_bounds.size.width.into();
-        let height: f32 = gpui_bounds.size.height.into();
-        let screen_bounds = Bounds::new(
-            gpui_bounds.origin,
-            Size {
-                width: px(width * zoom),
-                height: px(height * zoom),
-            },
-        );
-
-        // Decide whether to expand children based on screen size
-        let children =
-            if node.is_directory() && !node.children.is_empty() && should_expand(screen_bounds) {
-                // Apply padding for directory nesting
-                let padding = px(4.);
-                let inner_bounds = Bounds::new(
-                    Point::new(
-                        gpui_bounds.origin.x + padding,
-                        gpui_bounds.origin.y + padding,
-                    ),
+    items
+        .iter()
+        .map(|(idx, _, item_rect)| {
+            let node = &nodes[*idx];
+            LayoutNode {
+                id: node.id,
+                name: node.name.clone(),
+                bounds: Bounds::new(
+                    Point::new(px(item_rect.x as f32), px(item_rect.y as f32)),
                     Size {
-                        width: (gpui_bounds.size.width - padding * 2.).max(px(0.)),
-                        height: (gpui_bounds.size.height - padding * 2.).max(px(0.)),
+                        width: px(item_rect.w as f32),
+                        height: px(item_rect.h as f32),
                     },
-                );
-                layout_tree(&node.children, inner_bounds, zoom)
-            } else {
-                Vec::new()
-            };
-
-        recursive_layout.push(RecursiveLayoutNode {
-            id: node.id,
-            name: node.name.clone(),
-            bounds: gpui_bounds,
-            children,
-        });
-    }
-
-    recursive_layout
+                ),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
